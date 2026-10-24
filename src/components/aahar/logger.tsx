@@ -294,6 +294,33 @@ export function Logger({
   const chunks = useRef<Blob[]>([]);
 
   useEffect(() => {
+    const host = window as unknown as {
+      __aaharFilmed?: (bytes: number) => void;
+      __aaharFilmError?: (message: string) => void;
+    };
+    host.__aaharFilmed = (bytes: number) => {
+      if (!bytes) return;
+      void fetch(`/clips/meal.mp4?t=${Date.now()}`)
+        .then((res) => {
+          if (!res.ok) throw new Error("missing");
+          return res.blob();
+        })
+        .then((blob) => {
+          const file = new File([blob], "meal.mp4", { type: "video/mp4" });
+          void useClipFile(file);
+        })
+        .catch(() => setError("That clip didn't come back. Film it again."));
+    };
+    host.__aaharFilmError = (message: string) => setError(message || "The camera didn't open.");
+    return () => {
+      delete host.__aaharFilmed;
+      delete host.__aaharFilmError;
+    };
+    // The phone calls back after the camera closes. useClipFile is the latest save.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
     if (touched) return;
     const text = [transcript, interim].filter(Boolean).join(" ").trim();
     setItems(parseMealText(text));
@@ -615,6 +642,12 @@ export function Logger({
   }
 
   function onFilm() {
+    const film = (window as unknown as { AaharFilm?: { film: () => void } }).AaharFilm;
+    if (film) {
+      setError(null);
+      film.film();
+      return;
+    }
     if (isHandheld() || !cameraAllowed() || typeof MediaRecorder === "undefined" || !navigator.mediaDevices?.getUserMedia) {
       pickPhoneClip();
       return;
@@ -915,7 +948,7 @@ export function Logger({
               ) : null}
             </div>
           )}
-          {videoUrl ? <video src={videoUrl} controls playsInline className="media" /> : null}
+          {videoUrl ? <video src={videoUrl} controls playsInline className="media frame" /> : null}
           <div className="flex flex-wrap gap-2">
             <Button
               variant="quiet"

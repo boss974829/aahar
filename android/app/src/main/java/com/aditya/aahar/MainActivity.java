@@ -29,17 +29,25 @@ import androidx.webkit.WebViewAssetLoader;
 import org.json.JSONObject;
 
 import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileNotFoundException;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
 
 public class MainActivity extends Activity {
     private static final String START = "https://appassets.androidplatform.net/assets/www/index.html";
     private static final int REQ_PERMS = 1;
     private static final int REQ_FILE = 2;
     private static final int REQ_SPEECH = 3;
+    private static final int REQ_FILM = 4;
 
     private WebView web;
     private SpeechBridge speech;
     private ValueCallback<Uri[]> upload;
     private Uri pendingClip;
+    private boolean filmAfterPerm;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -55,6 +63,7 @@ public class MainActivity extends Activity {
 
         WebViewAssetLoader assets = new WebViewAssetLoader.Builder()
                 .addPathHandler("/assets/", new WebViewAssetLoader.AssetsPathHandler(this))
+                .addPathHandler("/clips/", this::serveClip)
                 .build();
 
         web = new WebView(this);
@@ -67,6 +76,7 @@ public class MainActivity extends Activity {
         settings.setMediaPlaybackRequiresUserGesture(false);
         speech = new SpeechBridge(this, web);
         web.addJavascriptInterface(speech, "AaharSpeech");
+        web.addJavascriptInterface(new FilmBridge(), "AaharFilm");
 
         web.setWebChromeClient(new WebChromeClient() {
             @Override
@@ -91,6 +101,98 @@ public class MainActivity extends Activity {
         });
         web.loadUrl(START);
         setContentView(web);
+    }
+
+    private File clipFile() {
+        File dir = new File(getCacheDir(), "clips");
+        if (!dir.exists()) dir.mkdirs();
+        return new File(dir, "meal.mp4");
+    }
+
+    private WebResourceResponse serveClip(String path) {
+        String name = path == null ? "" : path;
+        int query = name.indexOf('?');
+        if (query >= 0) name = name.substring(0, query);
+        if (!"meal.mp4".equals(new File(name).getName())) return null;
+        File file = clipFile();
+        if (!file.isFile() || file.length() < 1000) return null;
+        try {
+            WebResourceResponse response = new WebResourceResponse("video/mp4", null, new FileInputStream(file));
+            java.util.Map<String, String> headers = new java.util.HashMap<>();
+            headers.put("Cache-Control", "no-store");
+            response.setResponseHeaders(headers);
+            return response;
+        } catch (FileNotFoundException ex) {
+            return null;
+        }
+    }
+
+    private void tellFilm(String message) {
+        if (web == null) return;
+        String quoted = JSONObject.quote(message == null ? "" : message);
+        web.post(() -> web.evaluateJavascript("window.__aaharFilmError && window.__aaharFilmError(" + quoted + ")", null));
+    }
+
+    private void tellFilmed(long bytes) {
+        if (web == null) return;
+        web.post(() -> web.evaluateJavascript("window.__aaharFilmed && window.__aaharFilmed(" + bytes + ")", null));
+    }
+
+    private void launchFilm() {
+        File out = clipFile();
+        if (out.exists() && !out.delete()) {
+            tellFilm("The camera couldn't start. Try again.");
+            return;
+        }
+        Uri uri = FileProvider.getUriForFile(this, getPackageName() + ".files", out);
+        pendingClip = uri;
+        Intent intent = new Intent(MediaStore.ACTION_VIDEO_CAPTURE);
+        intent.putExtra(MediaStore.EXTRA_OUTPUT, uri);
+        intent.putExtra(MediaStore.EXTRA_DURATION_LIMIT, 12);
+        intent.putExtra(MediaStore.EXTRA_VIDEO_QUALITY, 0);
+        intent.putExtra(MediaStore.EXTRA_SIZE_LIMIT, 8L * 1024 * 1024);
+        intent.setClipData(ClipData.newRawUri("meal", uri));
+        int flags = Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION;
+        intent.addFlags(flags);
+        int match = Build.VERSION.SDK_INT >= 23 ? PackageManager.MATCH_ALL : PackageManager.MATCH_DEFAULT_ONLY;
+        for (ResolveInfo info : getPackageManager().queryIntentActivities(intent, match)) {
+            grantUriPermission(info.activityInfo.packageName, uri, flags);
+        }
+        try {
+            startActivityForResult(intent, REQ_FILM);
+        } catch (ActivityNotFoundException ex) {
+            pendingClip = null;
+            tellFilm("This phone has no camera app.");
+        }
+    }
+
+    private boolean copyInto(Uri source, File dest) {
+        try (InputStream in = getContentResolver().openInputStream(source);
+             OutputStream out = new FileOutputStream(dest)) {
+            if (in == null) return false;
+            byte[] buf = new byte[16384];
+            int n;
+            long total = 0;
+            while ((n = in.read(buf)) >= 0) {
+                if (n == 0) continue;
+                total += n;
+                if (total > 12_000_000) return false;
+                out.write(buf, 0, n);
+            }
+            out.flush();
+        } catch (IOException ex) {
+            return false;
+        }
+        return dest.length() >= 1000;
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] results) {
+        super.onRequestPermissionsResult(requestCode, permissions, results);
+        if (requestCode != REQ_PERMS || !filmAfterPerm) return;
+        filmAfterPerm = false;
+        if (captureGranted()) launchFilm();
+        else tellFilm("Allow the camera to film a meal.");
     }
 
     private void launchChooser(boolean videoCapture) {
@@ -130,7 +232,8 @@ public class MainActivity extends Activity {
         Intent intent = new Intent(MediaStore.ACTION_VIDEO_CAPTURE);
         intent.putExtra(MediaStore.EXTRA_OUTPUT, uri);
         intent.putExtra(MediaStore.EXTRA_DURATION_LIMIT, 12);
-        intent.putExtra(MediaStore.EXTRA_VIDEO_QUALITY, 1);
+        intent.putExtra(MediaStore.EXTRA_VIDEO_QUALITY, 0);
+        intent.putExtra(MediaStore.EXTRA_SIZE_LIMIT, 8L * 1024 * 1024);
         intent.setClipData(ClipData.newRawUri("meal", uri));
         intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
         return intent;
@@ -158,6 +261,24 @@ public class MainActivity extends Activity {
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode == REQ_FILM) {
+            if (resultCode != RESULT_OK) {
+                pendingClip = null;
+                tellFilmed(0);
+                return;
+            }
+            Uri returned = data != null ? data.getData() : null;
+            if (returned == null && data != null && data.getClipData() != null && data.getClipData().getItemCount() > 0) {
+                returned = data.getClipData().getItemAt(0).getUri();
+            }
+            File dest = clipFile();
+            boolean wrote = dest.length() >= 1000;
+            if (!wrote && returned != null) wrote = copyInto(returned, dest);
+            pendingClip = null;
+            if (!wrote) tellFilm("That clip didn't come back. Film it again.");
+            else tellFilmed(dest.length());
+            return;
+        }
         if (requestCode == REQ_SPEECH) {
             String text = "";
             if (resultCode == RESULT_OK && data != null) {
@@ -187,6 +308,20 @@ public class MainActivity extends Activity {
             return;
         }
         super.onBackPressed();
+    }
+
+    public class FilmBridge {
+        @JavascriptInterface
+        public void film() {
+            runOnUiThread(() -> {
+                if (!captureGranted()) {
+                    filmAfterPerm = true;
+                    requestPermissions(new String[] {Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO}, REQ_PERMS);
+                    return;
+                }
+                launchFilm();
+            });
+        }
     }
 }
 
