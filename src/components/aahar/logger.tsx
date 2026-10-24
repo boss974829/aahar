@@ -294,41 +294,48 @@ export function Logger({
   const chunks = useRef<Blob[]>([]);
 
   useEffect(() => {
+    const parts: string[] = [];
     const host = window as unknown as {
-      __aaharFilmed?: (bytes: number) => void;
+      __aaharClipStart?: () => void;
+      __aaharClipPart?: (part: string) => void;
+      __aaharClipEnd?: () => void;
       __aaharFilmError?: (message: string) => void;
     };
-    host.__aaharFilmed = (bytes: number) => {
-      if (!bytes) return;
-      const url = `https://appassets.androidplatform.net/clips/meal.mp4?t=${Date.now()}`;
-      setVideoUrl((prev) => {
-        if (prev?.startsWith("blob:")) URL.revokeObjectURL(prev);
-        return url;
-      });
-      setVideoBlob(null);
-      setError(null);
-      setCameraOpen(false);
-      setFilming(false);
-      void fetch(url)
-        .then((res) => {
-          if (!res.ok) throw new Error("missing");
-          return res.blob();
-        })
-        .then(async (blob) => {
-          if (blob.size < 1000) throw new Error("empty");
-          setVideoBlob(new Blob([blob], { type: "video/mp4" }));
-          const still = await frameFromUrl(url);
+    host.__aaharClipStart = () => {
+      parts.length = 0;
+    };
+    host.__aaharClipPart = (part: string) => {
+      parts.push(part);
+    };
+    host.__aaharClipEnd = () => {
+      try {
+        const bin = atob(parts.join(""));
+        const bytes = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i += 1) bytes[i] = bin.charCodeAt(i);
+        const blob = new Blob([bytes], { type: "video/mp4" });
+        const url = URL.createObjectURL(blob);
+        setVideoUrl((prev) => {
+          if (prev?.startsWith("blob:")) URL.revokeObjectURL(prev);
+          return url;
+        });
+        setVideoBlob(blob);
+        setError(null);
+        setCameraOpen(false);
+        setFilming(false);
+        void frameFromUrl(url).then((still) => {
           if (still) setFrame(still);
-        })
-        .catch(() => setError("The clip opened, but it couldn't be kept. Film it again."));
+        });
+      } catch {
+        setError("That clip didn't come back. Film it again.");
+      }
     };
     host.__aaharFilmError = (message: string) => setError(message || "The camera didn't open.");
     return () => {
-      delete host.__aaharFilmed;
+      delete host.__aaharClipStart;
+      delete host.__aaharClipPart;
+      delete host.__aaharClipEnd;
       delete host.__aaharFilmError;
     };
-    // The phone calls back after the camera closes. useClipFile is the latest save.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {

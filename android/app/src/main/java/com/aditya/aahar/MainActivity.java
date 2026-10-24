@@ -4,7 +4,6 @@ import android.Manifest;
 import android.app.Activity;
 import android.content.ActivityNotFoundException;
 import android.content.ClipData;
-import android.content.ContentValues;
 import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.content.pm.ResolveInfo;
@@ -15,6 +14,7 @@ import android.provider.MediaStore;
 import android.speech.RecognitionListener;
 import android.speech.RecognizerIntent;
 import android.speech.SpeechRecognizer;
+import android.util.Base64;
 import android.webkit.JavascriptInterface;
 import android.webkit.PermissionRequest;
 import android.webkit.ValueCallback;
@@ -48,7 +48,6 @@ public class MainActivity extends Activity {
     private SpeechBridge speech;
     private ValueCallback<Uri[]> upload;
     private Uri pendingClip;
-    private Uri staged;
     private boolean filmAfterPerm;
 
     @Override
@@ -204,57 +203,49 @@ public class MainActivity extends Activity {
         web.post(() -> web.evaluateJavascript("window.__aaharFilmError && window.__aaharFilmError(" + quoted + ")", null));
     }
 
-    private void tellFilmed(long bytes) {
-        if (web == null) return;
-        web.post(() -> web.evaluateJavascript("window.__aaharFilmed && window.__aaharFilmed(" + bytes + ")", null));
-    }
-
     private void launchFilm() {
-        staged = null;
         Intent intent = new Intent(MediaStore.ACTION_VIDEO_CAPTURE);
         intent.putExtra(MediaStore.EXTRA_DURATION_LIMIT, 12);
         intent.putExtra(MediaStore.EXTRA_VIDEO_QUALITY, 0);
         intent.putExtra(MediaStore.EXTRA_SIZE_LIMIT, 20L * 1024 * 1024);
-        if (Build.VERSION.SDK_INT >= 29) {
-            try {
-                ContentValues values = new ContentValues();
-                values.put(MediaStore.Video.Media.DISPLAY_NAME, "aahar-meal.mp4");
-                values.put(MediaStore.Video.Media.MIME_TYPE, "video/mp4");
-                values.put(MediaStore.Video.Media.RELATIVE_PATH, "Movies/Aahar");
-                staged = getContentResolver().insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values);
-            } catch (RuntimeException ex) {
-                staged = null;
-            }
-        }
-        if (staged != null) {
-            intent.putExtra(MediaStore.EXTRA_OUTPUT, staged);
-            intent.setClipData(ClipData.newRawUri("meal", staged));
-            int flags = Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION;
-            intent.addFlags(flags);
-            int match = PackageManager.MATCH_ALL;
-            for (ResolveInfo info : getPackageManager().queryIntentActivities(intent, match)) {
-                grantUriPermission(info.activityInfo.packageName, staged, flags);
-            }
-        }
         try {
             startActivityForResult(intent, REQ_FILM);
         } catch (ActivityNotFoundException ex) {
-            clearStaged();
-            tellFilm("This phone has no camera app.");
+            Intent pick = new Intent(Intent.ACTION_GET_CONTENT);
+            pick.addCategory(Intent.CATEGORY_OPENABLE);
+            pick.setType("video/*");
+            try {
+                startActivityForResult(Intent.createChooser(pick, "Meal clip"), REQ_FILM);
+            } catch (ActivityNotFoundException again) {
+                tellFilm("This phone has no camera app.");
+            }
         } catch (RuntimeException ex) {
-            clearStaged();
             tellFilm("The camera didn't open.");
         }
     }
 
-    private void clearStaged() {
-        if (staged == null) return;
-        try {
-            getContentResolver().delete(staged, null, null);
-        } catch (RuntimeException ignored) {
-            // The gallery row is optional.
+    private void deliverClip(File file) {
+        byte[] data;
+        try (FileInputStream in = new FileInputStream(file)) {
+            data = in.readAllBytes();
+        } catch (IOException ex) {
+            tellFilm("That clip didn't come back. Film it again.");
+            return;
         }
-        staged = null;
+        if (data.length < 1000) {
+            tellFilm("That clip didn't come back. Film it again.");
+            return;
+        }
+        String encoded = Base64.encodeToString(data, Base64.NO_WRAP);
+        web.post(() -> {
+            web.evaluateJavascript("window.__aaharClipStart && window.__aaharClipStart()", null);
+            int step = 32000;
+            for (int i = 0; i < encoded.length(); i += step) {
+                String part = encoded.substring(i, Math.min(encoded.length(), i + step));
+                web.evaluateJavascript("window.__aaharClipPart && window.__aaharClipPart(" + JSONObject.quote(part) + ")", null);
+            }
+            web.evaluateJavascript("window.__aaharClipEnd && window.__aaharClipEnd()", null);
+        });
     }
 
     private boolean copyInto(Uri source, File dest) {
@@ -353,21 +344,23 @@ public class MainActivity extends Activity {
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
         if (requestCode == REQ_FILM) {
-            if (resultCode != RESULT_OK) {
-                clearStaged();
-                tellFilmed(0);
+            if (resultCode != RESULT_OK || data == null) {
                 return;
             }
-            Uri returned = data != null ? data.getData() : null;
-            if (returned == null && data != null && data.getClipData() != null && data.getClipData().getItemCount() > 0) {
+            Uri returned = data.getData();
+            if (returned == null && data.getClipData() != null && data.getClipData().getItemCount() > 0) {
                 returned = data.getClipData().getItemAt(0).getUri();
             }
+            if (returned == null) {
+                tellFilm("That clip didn't come back. Film it again.");
+                return;
+            }
             File dest = clipFile();
-            boolean wrote = staged != null && copyInto(staged, dest);
-            if (!wrote && returned != null) wrote = copyInto(returned, dest);
-            clearStaged();
-            if (!wrote) tellFilm("That clip didn't come back. Film it again.");
-            else tellFilmed(dest.length());
+            if (!copyInto(returned, dest)) {
+                tellFilm("That clip didn't come back. Film it again.");
+                return;
+            }
+            deliverClip(dest);
             return;
         }
         if (requestCode == REQ_SPEECH) {
