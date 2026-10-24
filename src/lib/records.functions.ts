@@ -367,7 +367,19 @@ sketch is breakfast, lunch, and dinner in three short lines. Indian home food is
     }
   });
 
-const AUDIO_TYPES = new Set(["audio/webm", "audio/mp4", "audio/mpeg", "audio/wav", "audio/ogg", "audio/aac"]);
+const AUDIO_TYPES = new Set([
+  "audio/webm",
+  "audio/mp4",
+  "audio/mpeg",
+  "audio/wav",
+  "audio/ogg",
+  "audio/aac",
+  "audio/3gpp",
+  "audio/3gpp2",
+  "video/mp4",
+  "video/webm",
+  "video/3gpp",
+]);
 
 export const transcribeClip = createServerFn({ method: "POST" })
   .validator((input: unknown) => TranscribeInput.parse(input))
@@ -378,13 +390,14 @@ export const transcribeClip = createServerFn({ method: "POST" })
     const mime = data.mime.split(";")[0]?.trim().toLowerCase() ?? "";
     if (!AUDIO_TYPES.has(mime)) return { ok: false, error: "That audio format isn't supported." };
     const bytes = Buffer.from(data.audioBase64, "base64");
-    if (bytes.byteLength < 800) return { ok: false, error: "That clip was too short to hear." };
+    if (bytes.byteLength < 80) return { ok: false, error: "That clip was too short to hear." };
     if (bytes.byteLength > 1_200_000) return { ok: false, error: "Keep the voice clip under half a minute." };
     const form = new FormData();
     form.set("model", "grok-voice-transcribe-2.0");
     form.set("language", data.lang);
-    form.set("format", "true");
-    form.set("file", new Blob([bytes], { type: mime }), "meal.webm");
+    if (data.lang === "en") form.set("format", "true");
+    const ext = mime.includes("mp4") || mime.includes("3gpp") ? "mp4" : mime.includes("wav") ? "wav" : mime.includes("mpeg") ? "mp3" : "webm";
+    form.set("file", new File([bytes], `meal.${ext}`, { type: mime }), `meal.${ext}`);
     try {
       const res = await fetch("https://api.x.ai/v1/stt", {
         method: "POST",

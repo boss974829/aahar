@@ -89,7 +89,49 @@ function listenNative(lang: Lang): Promise<string> {
   });
 }
 
+function listenWeb(lang: Lang): Promise<string> {
+  const Ctor = speechCtor();
+  if (!Ctor) return Promise.resolve("");
+  return new Promise((resolve) => {
+    const rec = new Ctor();
+    rec.lang = lang === "hi" ? "hi-IN" : "en-IN";
+    rec.interimResults = false;
+    rec.continuous = false;
+    let settled = false;
+    const finish = (text: string) => {
+      if (settled) return;
+      settled = true;
+      window.clearTimeout(timer);
+      resolve(text.trim());
+    };
+    const timer = window.setTimeout(() => {
+      try {
+        rec.stop();
+      } catch {
+        finish("");
+      }
+    }, 8_000);
+    rec.onresult = (event) => {
+      const said = event.results?.[0]?.[0]?.transcript ?? "";
+      finish(said);
+    };
+    rec.onerror = () => finish("");
+    rec.onend = () => {
+      window.setTimeout(() => finish(""), 400);
+    };
+    try {
+      rec.start();
+    } catch {
+      finish("");
+    }
+  });
+}
+
 async function audioPayload(blob: Blob): Promise<{ audioBase64: string; mime: string }> {
+  const original = (blob.type || "audio/webm").split(";")[0] || "audio/webm";
+  if (blob.size > 800 && original !== "audio/webm") {
+    return { audioBase64: await blobToB64(blob), mime: original };
+  }
   try {
     const ctx = new AudioContext();
     const decoded = await ctx.decodeAudioData(await blob.arrayBuffer());
@@ -131,7 +173,7 @@ async function audioPayload(blob: Blob): Promise<{ audioBase64: string; mime: st
     for (let i = 0; i < pcm.length; i += 1, offset += 2) view.setInt16(offset, pcm[i] ?? 0, true);
     return { audioBase64: bytesToB64(new Uint8Array(buffer)), mime: "audio/wav" };
   } catch {
-    return { audioBase64: await blobToB64(blob), mime: (blob.type || "audio/webm").split(";")[0] || "audio/webm" };
+    return { audioBase64: await blobToB64(blob), mime: original };
   }
 }
 
@@ -311,7 +353,11 @@ export function Logger({
       setTranscript(joined);
       setInterim(pending);
     };
-    rec.onerror = () => setError("The microphone didn't catch that. You can type instead.");
+    rec.onerror = (event) => {
+      const code = (event as { error?: string }).error;
+      if (code === "no-speech" || code === "aborted") return;
+      setError("The microphone didn't catch that. You can type instead.");
+    };
     rec.onend = () => {
       if (wantSpeech.current) {
         try {
@@ -369,7 +415,7 @@ export function Logger({
         const blob = new Blob(chunks.current, { type: rec.mimeType || "audio/webm" });
         if (blob.size > 0) setAudioBlob(blob);
       };
-      rec.start();
+      rec.start(200);
       audioRec.current = rec;
       window.setTimeout(() => {
         if (audioRec.current === rec && rec.state !== "inactive") {
@@ -574,13 +620,19 @@ export function Logger({
 
   async function estimate() {
     const text = [transcript, interim].filter(Boolean).join(" ").trim();
-    setBusy("Estimating…");
     setError(null);
     const local = parseMealText(text);
     if (local.length) {
       setItems(local);
       setTouched(true);
+      setNote("From the home-cooking table. You can change the grams.");
     }
+    if (!text && !frame) {
+      setError("Type the meal, or add a photo, then estimate.");
+      return;
+    }
+    if (local.length && !frame) return;
+    setBusy("Estimating…");
     try {
       const image = frame && frame.length < 400_000 ? frame : undefined;
       const res = await estimateMeal({ data: { text, image, lang } });
@@ -589,9 +641,11 @@ export function Logger({
         return;
       }
       const incoming = res.data.items.map((item) => ({ ...item, id: crypto.randomUUID() }));
-      setItems(incoming);
-      setTouched(true);
-      setNote(res.data.note || null);
+      if (incoming.length) {
+        setItems(incoming);
+        setTouched(true);
+        setNote(res.data.note || null);
+      }
     } catch {
       if (!local.length) setError("The estimate didn't come through. Name the foods, or pick them below.");
     } finally {
@@ -599,42 +653,37 @@ export function Logger({
     }
   }
 
+  function remember(text: string) {
+    const heard = text.trim();
+    if (!heard) return false;
+    setTranscript((prev) => [prev.trim(), heard].filter(Boolean).join(" "));
+    setInterim("");
+    setTouched(false);
+    return true;
+  }
+
   async function transcribe() {
+    const clip = audioBlob ?? videoBlob;
     setBusy("Transcribing…");
     setError(null);
     try {
-      if (audioBlob) {
-        const payload = await audioPayload(audioBlob);
+      if (clip) {
+        const payload = await audioPayload(clip);
         const res = await transcribeClip({ data: { ...payload, lang } });
         if (res.ok && res.data.text) {
-          setTranscript((prev) => [prev.trim(), res.data.text].filter(Boolean).join(" "));
-          setInterim("");
-          setTouched(false);
+          remember(res.data.text);
           return;
         }
-        const onPhone = nativeSpeech() || /phone|device|unavailable/i.test(res.ok ? "" : res.error);
-        if (onPhone) {
-          const heard = await listenNative(lang);
-          if (heard) {
-            setTranscript((prev) => [prev.trim(), heard].filter(Boolean).join(" "));
-            setInterim("");
-            setTouched(false);
-            return;
-          }
-        }
-        if (!res.ok) {
-          setError(res.error);
+        const needsDevice = !res.ok && (nativeSpeech() != null || /phone|device|unavailable/i.test(res.error));
+        if (!needsDevice) {
+          if (!res.ok) setError(res.error);
           return;
         }
-      } else if (nativeSpeech()) {
-        const heard = await listenNative(lang);
-        if (heard) {
-          setTranscript((prev) => [prev.trim(), heard].filter(Boolean).join(" "));
-          setTouched(false);
-          return;
-        }
-        setError("No words were heard. Try again a little closer to the phone, or type the meal.");
       }
+      setBusy("Listening…");
+      const heard = nativeSpeech() ? await listenNative(lang) : await listenWeb(lang);
+      if (remember(heard)) return;
+      setError("No words were heard. Speak the meal again, a little closer, or type it.");
     } catch {
       setError("Transcription didn't succeed. You can type the meal.");
     } finally {
@@ -872,9 +921,9 @@ export function Logger({
             >
               {busy === "Estimating…" ? busy : "Estimate nutrients"}
             </Button>
-            {audioBlob ? (
+            {audioBlob || videoBlob ? (
               <Button variant="quiet" className="h-11" disabled={!!busy} onClick={() => void transcribe()}>
-                {busy === "Transcribing…" ? busy : "Transcribe clip"}
+                {busy === "Transcribing…" || busy === "Listening…" ? busy : "Transcribe clip"}
               </Button>
             ) : null}
             {transcript.trim() ? (
