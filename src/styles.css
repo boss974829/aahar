@@ -1,4 +1,7 @@
 @import "tailwindcss";
+@source "./components";
+@source "./routes";
+@source "./apk";
 
 @custom-variant dark (&:where(.dark, .dark *));
 
