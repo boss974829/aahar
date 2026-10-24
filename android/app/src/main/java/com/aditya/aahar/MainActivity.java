@@ -4,6 +4,7 @@ import android.Manifest;
 import android.app.Activity;
 import android.content.ActivityNotFoundException;
 import android.content.ClipData;
+import android.content.ContentValues;
 import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.content.pm.ResolveInfo;
@@ -47,6 +48,7 @@ public class MainActivity extends Activity {
     private SpeechBridge speech;
     private ValueCallback<Uri[]> upload;
     private Uri pendingClip;
+    private Uri staged;
     private boolean filmAfterPerm;
 
     @Override
@@ -63,7 +65,6 @@ public class MainActivity extends Activity {
 
         WebViewAssetLoader assets = new WebViewAssetLoader.Builder()
                 .addPathHandler("/assets/", new WebViewAssetLoader.AssetsPathHandler(this))
-                .addPathHandler("/clips/", this::serveClip)
                 .build();
 
         web = new WebView(this);
@@ -96,7 +97,12 @@ public class MainActivity extends Activity {
         web.setWebViewClient(new WebViewClient() {
             @Override
             public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {
-                return assets.shouldInterceptRequest(request.getUrl());
+                Uri url = request.getUrl();
+                if (url != null && "meal.mp4".equals(url.getLastPathSegment()) && url.getPath() != null && url.getPath().contains("/clips/")) {
+                    WebResourceResponse clip = serveVideo(request);
+                    if (clip != null) return clip;
+                }
+                return assets.shouldInterceptRequest(url);
             }
         });
         web.loadUrl(START);
@@ -109,21 +115,86 @@ public class MainActivity extends Activity {
         return new File(dir, "meal.mp4");
     }
 
-    private WebResourceResponse serveClip(String path) {
-        String name = path == null ? "" : path;
-        int query = name.indexOf('?');
-        if (query >= 0) name = name.substring(0, query);
-        if (!"meal.mp4".equals(new File(name).getName())) return null;
+    private WebResourceResponse serveVideo(WebResourceRequest request) {
         File file = clipFile();
         if (!file.isFile() || file.length() < 1000) return null;
+        long length = file.length();
+        String range = null;
+        if (request.getRequestHeaders() != null) {
+            for (java.util.Map.Entry<String, String> entry : request.getRequestHeaders().entrySet()) {
+                if ("range".equalsIgnoreCase(entry.getKey())) range = entry.getValue();
+            }
+        }
         try {
-            WebResourceResponse response = new WebResourceResponse("video/mp4", null, new FileInputStream(file));
-            java.util.Map<String, String> headers = new java.util.HashMap<>();
-            headers.put("Cache-Control", "no-store");
-            response.setResponseHeaders(headers);
-            return response;
-        } catch (FileNotFoundException ex) {
+            if (range != null && range.startsWith("bytes=")) {
+                String spec = range.substring(6);
+                int dash = spec.indexOf('-');
+                if (dash <= 0) return fullVideo(file, length);
+                long start = Long.parseLong(spec.substring(0, dash).trim());
+                long end = dash + 1 < spec.length() && !spec.substring(dash + 1).trim().isEmpty()
+                        ? Long.parseLong(spec.substring(dash + 1).trim())
+                        : length - 1;
+                if (start < 0 || start >= length) return fullVideo(file, length);
+                if (end >= length) end = length - 1;
+                long count = end - start + 1;
+                FileInputStream in = new FileInputStream(file);
+                long skipped = 0;
+                while (skipped < start) {
+                    long step = in.skip(start - skipped);
+                    if (step <= 0) break;
+                    skipped += step;
+                }
+                java.util.Map<String, String> headers = videoHeaders(count);
+                headers.put("Content-Range", "bytes " + start + "-" + end + "/" + length);
+                return new WebResourceResponse("video/mp4", null, 206, "Partial Content", headers, new Slice(in, count));
+            }
+            return fullVideo(file, length);
+        } catch (IOException | NumberFormatException ex) {
             return null;
+        }
+    }
+
+    private WebResourceResponse fullVideo(File file, long length) throws FileNotFoundException {
+        return new WebResourceResponse("video/mp4", null, 200, "OK", videoHeaders(length), new FileInputStream(file));
+    }
+
+    private java.util.Map<String, String> videoHeaders(long length) {
+        java.util.Map<String, String> headers = new java.util.HashMap<>();
+        headers.put("Accept-Ranges", "bytes");
+        headers.put("Content-Length", String.valueOf(length));
+        headers.put("Content-Type", "video/mp4");
+        headers.put("Cache-Control", "no-store");
+        return headers;
+    }
+
+    private static final class Slice extends java.io.InputStream {
+        private final InputStream in;
+        private long left;
+
+        Slice(InputStream in, long left) {
+            this.in = in;
+            this.left = left;
+        }
+
+        @Override
+        public int read() throws IOException {
+            if (left <= 0) return -1;
+            int b = in.read();
+            if (b >= 0) left -= 1;
+            return b;
+        }
+
+        @Override
+        public int read(byte[] buffer, int off, int len) throws IOException {
+            if (left <= 0) return -1;
+            int n = in.read(buffer, off, (int) Math.min(len, left));
+            if (n > 0) left -= n;
+            return n;
+        }
+
+        @Override
+        public void close() throws IOException {
+            in.close();
         }
     }
 
@@ -139,31 +210,51 @@ public class MainActivity extends Activity {
     }
 
     private void launchFilm() {
-        File out = clipFile();
-        if (out.exists() && !out.delete()) {
-            tellFilm("The camera couldn't start. Try again.");
-            return;
-        }
-        Uri uri = FileProvider.getUriForFile(this, getPackageName() + ".files", out);
-        pendingClip = uri;
+        staged = null;
         Intent intent = new Intent(MediaStore.ACTION_VIDEO_CAPTURE);
-        intent.putExtra(MediaStore.EXTRA_OUTPUT, uri);
         intent.putExtra(MediaStore.EXTRA_DURATION_LIMIT, 12);
         intent.putExtra(MediaStore.EXTRA_VIDEO_QUALITY, 0);
-        intent.putExtra(MediaStore.EXTRA_SIZE_LIMIT, 8L * 1024 * 1024);
-        intent.setClipData(ClipData.newRawUri("meal", uri));
-        int flags = Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION;
-        intent.addFlags(flags);
-        int match = Build.VERSION.SDK_INT >= 23 ? PackageManager.MATCH_ALL : PackageManager.MATCH_DEFAULT_ONLY;
-        for (ResolveInfo info : getPackageManager().queryIntentActivities(intent, match)) {
-            grantUriPermission(info.activityInfo.packageName, uri, flags);
+        intent.putExtra(MediaStore.EXTRA_SIZE_LIMIT, 20L * 1024 * 1024);
+        if (Build.VERSION.SDK_INT >= 29) {
+            try {
+                ContentValues values = new ContentValues();
+                values.put(MediaStore.Video.Media.DISPLAY_NAME, "aahar-meal.mp4");
+                values.put(MediaStore.Video.Media.MIME_TYPE, "video/mp4");
+                values.put(MediaStore.Video.Media.RELATIVE_PATH, "Movies/Aahar");
+                staged = getContentResolver().insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values);
+            } catch (RuntimeException ex) {
+                staged = null;
+            }
+        }
+        if (staged != null) {
+            intent.putExtra(MediaStore.EXTRA_OUTPUT, staged);
+            intent.setClipData(ClipData.newRawUri("meal", staged));
+            int flags = Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION;
+            intent.addFlags(flags);
+            int match = PackageManager.MATCH_ALL;
+            for (ResolveInfo info : getPackageManager().queryIntentActivities(intent, match)) {
+                grantUriPermission(info.activityInfo.packageName, staged, flags);
+            }
         }
         try {
             startActivityForResult(intent, REQ_FILM);
         } catch (ActivityNotFoundException ex) {
-            pendingClip = null;
+            clearStaged();
             tellFilm("This phone has no camera app.");
+        } catch (RuntimeException ex) {
+            clearStaged();
+            tellFilm("The camera didn't open.");
         }
+    }
+
+    private void clearStaged() {
+        if (staged == null) return;
+        try {
+            getContentResolver().delete(staged, null, null);
+        } catch (RuntimeException ignored) {
+            // The gallery row is optional.
+        }
+        staged = null;
     }
 
     private boolean copyInto(Uri source, File dest) {
@@ -176,7 +267,7 @@ public class MainActivity extends Activity {
             while ((n = in.read(buf)) >= 0) {
                 if (n == 0) continue;
                 total += n;
-                if (total > 12_000_000) return false;
+                if (total > 40_000_000) return false;
                 out.write(buf, 0, n);
             }
             out.flush();
@@ -263,7 +354,7 @@ public class MainActivity extends Activity {
         super.onActivityResult(requestCode, resultCode, data);
         if (requestCode == REQ_FILM) {
             if (resultCode != RESULT_OK) {
-                pendingClip = null;
+                clearStaged();
                 tellFilmed(0);
                 return;
             }
@@ -272,9 +363,9 @@ public class MainActivity extends Activity {
                 returned = data.getClipData().getItemAt(0).getUri();
             }
             File dest = clipFile();
-            boolean wrote = dest.length() >= 1000;
+            boolean wrote = staged != null && copyInto(staged, dest);
             if (!wrote && returned != null) wrote = copyInto(returned, dest);
-            pendingClip = null;
+            clearStaged();
             if (!wrote) tellFilm("That clip didn't come back. Film it again.");
             else tellFilmed(dest.length());
             return;

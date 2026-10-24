@@ -300,16 +300,27 @@ export function Logger({
     };
     host.__aaharFilmed = (bytes: number) => {
       if (!bytes) return;
-      void fetch(`/clips/meal.mp4?t=${Date.now()}`)
+      const url = `https://appassets.androidplatform.net/clips/meal.mp4?t=${Date.now()}`;
+      setVideoUrl((prev) => {
+        if (prev?.startsWith("blob:")) URL.revokeObjectURL(prev);
+        return url;
+      });
+      setVideoBlob(null);
+      setError(null);
+      setCameraOpen(false);
+      setFilming(false);
+      void fetch(url)
         .then((res) => {
           if (!res.ok) throw new Error("missing");
           return res.blob();
         })
-        .then((blob) => {
-          const file = new File([blob], "meal.mp4", { type: "video/mp4" });
-          void useClipFile(file);
+        .then(async (blob) => {
+          if (blob.size < 1000) throw new Error("empty");
+          setVideoBlob(new Blob([blob], { type: "video/mp4" }));
+          const still = await frameFromUrl(url);
+          if (still) setFrame(still);
         })
-        .catch(() => setError("That clip didn't come back. Film it again."));
+        .catch(() => setError("The clip opened, but it couldn't be kept. Film it again."));
     };
     host.__aaharFilmError = (message: string) => setError(message || "The camera didn't open.");
     return () => {
@@ -486,7 +497,7 @@ export function Logger({
       setError("That clip didn't come back. Film it again.");
       return;
     }
-    if (bytes.byteLength > 12_000_000) {
+    if (bytes.byteLength > 40_000_000) {
       setError("That clip is too long to keep. Film about 12 seconds.");
       return;
     }
