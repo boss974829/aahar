@@ -34,8 +34,10 @@ public class MainActivity extends Activity {
     private static final String START = "https://appassets.androidplatform.net/assets/www/index.html";
     private static final int REQ_PERMS = 1;
     private static final int REQ_FILE = 2;
+    private static final int REQ_SPEECH = 3;
 
     private WebView web;
+    private SpeechBridge speech;
     private ValueCallback<Uri[]> upload;
     private Uri pendingClip;
 
@@ -63,7 +65,8 @@ public class MainActivity extends Activity {
         settings.setAllowFileAccess(true);
         settings.setAllowContentAccess(true);
         settings.setMediaPlaybackRequiresUserGesture(false);
-        web.addJavascriptInterface(new SpeechBridge(this, web), "AaharSpeech");
+        speech = new SpeechBridge(this, web);
+        web.addJavascriptInterface(speech, "AaharSpeech");
 
         web.setWebChromeClient(new WebChromeClient() {
             @Override
@@ -155,6 +158,15 @@ public class MainActivity extends Activity {
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode == REQ_SPEECH) {
+            String text = "";
+            if (resultCode == RESULT_OK && data != null) {
+                java.util.ArrayList<String> list = data.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS);
+                if (list != null && !list.isEmpty() && list.get(0) != null) text = list.get(0);
+            }
+            if (speech != null) speech.deliver(text);
+            return;
+        }
         if (requestCode != REQ_FILE) return;
         Uri[] uris = WebChromeClient.FileChooserParams.parseResult(resultCode, data);
         if ((uris == null || uris.length == 0) && resultCode == RESULT_OK && data != null && data.getData() != null) {
@@ -192,12 +204,31 @@ class SpeechBridge {
 
     @JavascriptInterface
     public void listen(String lang) {
-        activity.runOnUiThread(() -> start(lang));
+        activity.runOnUiThread(() -> {
+            heard = false;
+            String code = lang != null && lang.startsWith("hi") ? "hi-IN" : "en-IN";
+            Intent intent = new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH);
+            intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM);
+            intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE, code);
+            intent.putExtra(RecognizerIntent.EXTRA_PROMPT, "Say what you ate");
+            intent.putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1);
+            try {
+                activity.startActivityForResult(intent, 3);
+            } catch (ActivityNotFoundException ex) {
+                start(code);
+            }
+        });
     }
 
     @JavascriptInterface
     public void stop() {
-        activity.runOnUiThread(() -> finish(""));
+        activity.runOnUiThread(() -> {
+            if (recognizer != null) finish("");
+        });
+    }
+
+    public void deliver(String text) {
+        activity.runOnUiThread(() -> finish(text));
     }
 
     private void start(String lang) {

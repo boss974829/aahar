@@ -72,19 +72,12 @@ function listenNative(lang: Lang): Promise<string> {
   const bridge = nativeSpeech();
   if (!bridge) return Promise.resolve("");
   return new Promise((resolve) => {
-    const host = window as unknown as {
-      __aaharHeard?: (text: string) => void;
-      __aaharPartial?: (text: string) => void;
-    };
-    const timer = window.setTimeout(() => {
-      bridge.stop();
-      resolve("");
-    }, 12_000);
+    const host = window as unknown as { __aaharHeard?: (text: string) => void };
+    const timer = window.setTimeout(() => resolve(""), 45_000);
     host.__aaharHeard = (text: string) => {
       window.clearTimeout(timer);
       resolve((text || "").trim());
     };
-    host.__aaharPartial = () => undefined;
     bridge.listen(lang === "hi" ? "hi-IN" : "en-IN");
   });
 }
@@ -127,53 +120,61 @@ function listenWeb(lang: Lang): Promise<string> {
   });
 }
 
-async function audioPayload(blob: Blob): Promise<{ audioBase64: string; mime: string }> {
-  const original = (blob.type || "audio/webm").split(";")[0] || "audio/webm";
-  if (blob.size > 800 && original !== "audio/webm") {
-    return { audioBase64: await blobToB64(blob), mime: original };
+async function wavFrom(blob: Blob): Promise<{ audioBase64: string; mime: string }> {
+  const ctx = new AudioContext();
+  const decoded = await ctx.decodeAudioData(await blob.arrayBuffer());
+  const rate = 16000;
+  const length = Math.max(1, Math.min(Math.ceil(decoded.duration * rate), rate * 20));
+  const offline = new OfflineAudioContext(1, length, rate);
+  const src = offline.createBufferSource();
+  src.buffer = decoded;
+  src.connect(offline.destination);
+  src.start();
+  const rendered = await offline.startRendering();
+  await ctx.close();
+  const samples = rendered.getChannelData(0);
+  const pcm = new Int16Array(samples.length);
+  for (let i = 0; i < samples.length; i += 1) {
+    const s = Math.max(-1, Math.min(1, samples[i] ?? 0));
+    pcm[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
   }
+  const data = pcm.length * 2;
+  const buffer = new ArrayBuffer(44 + data);
+  const view = new DataView(buffer);
+  const write = (offset: number, text: string) => {
+    for (let i = 0; i < text.length; i += 1) view.setUint8(offset + i, text.charCodeAt(i));
+  };
+  write(0, "RIFF");
+  view.setUint32(4, 36 + data, true);
+  write(8, "WAVE");
+  write(12, "fmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);
+  view.setUint32(24, rate, true);
+  view.setUint32(28, rate * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
+  write(36, "data");
+  view.setUint32(40, data, true);
+  let offset = 44;
+  for (let i = 0; i < pcm.length; i += 1, offset += 2) view.setInt16(offset, pcm[i] ?? 0, true);
+  return { audioBase64: bytesToB64(new Uint8Array(buffer)), mime: "audio/wav" };
+}
+
+async function audioPayload(blob: Blob): Promise<{ audioBase64: string; mime: string }> {
+  const mime = (blob.type || "audio/webm").split(";")[0] || "audio/webm";
+  const video = mime.startsWith("video/");
   try {
-    const ctx = new AudioContext();
-    const decoded = await ctx.decodeAudioData(await blob.arrayBuffer());
-    const rate = 16000;
-    const length = Math.max(1, Math.min(Math.ceil(decoded.duration * rate), rate * 30));
-    const offline = new OfflineAudioContext(1, length, rate);
-    const src = offline.createBufferSource();
-    src.buffer = decoded;
-    src.connect(offline.destination);
-    src.start();
-    const rendered = await offline.startRendering();
-    await ctx.close();
-    const samples = rendered.getChannelData(0);
-    const pcm = new Int16Array(samples.length);
-    for (let i = 0; i < samples.length; i += 1) {
-      const s = Math.max(-1, Math.min(1, samples[i] ?? 0));
-      pcm[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
-    }
-    const data = pcm.length * 2;
-    const buffer = new ArrayBuffer(44 + data);
-    const view = new DataView(buffer);
-    const write = (offset: number, text: string) => {
-      for (let i = 0; i < text.length; i += 1) view.setUint8(offset + i, text.charCodeAt(i));
-    };
-    write(0, "RIFF");
-    view.setUint32(4, 36 + data, true);
-    write(8, "WAVE");
-    write(12, "fmt ");
-    view.setUint32(16, 16, true);
-    view.setUint16(20, 1, true);
-    view.setUint16(22, 1, true);
-    view.setUint32(24, rate, true);
-    view.setUint32(28, rate * 2, true);
-    view.setUint16(32, 2, true);
-    view.setUint16(34, 16, true);
-    write(36, "data");
-    view.setUint32(40, data, true);
-    let offset = 44;
-    for (let i = 0; i < pcm.length; i += 1, offset += 2) view.setInt16(offset, pcm[i] ?? 0, true);
-    return { audioBase64: bytesToB64(new Uint8Array(buffer)), mime: "audio/wav" };
-  } catch {
-    return { audioBase64: await blobToB64(blob), mime: original };
+    return await Promise.race([
+      wavFrom(blob),
+      new Promise<never>((_, reject) => window.setTimeout(() => reject(new Error("slow")), 8_000)),
+    ]);
+  } catch (err) {
+    if (!video && blob.size < 900_000) return { audioBase64: await blobToB64(blob), mime };
+    throw err instanceof Error && err.message === "slow"
+      ? new Error("That clip took too long to read. Say the meal with Speak, or type it.")
+      : new Error("That clip couldn't be read. Say the meal with Speak, or type it.");
   }
 }
 
@@ -394,14 +395,17 @@ export function Logger({
       setError(null);
       void listenNative(lang).then((text) => {
         setListening(false);
-        if (!text) return;
+        if (!text) {
+          setError("No words were heard. Try Speak again, or type the meal.");
+          return;
+        }
         setTranscript((prev) => [prev.trim(), text].filter(Boolean).join(" "));
         setInterim("");
         setTouched(false);
       });
-    } else {
-      startSpeech();
+      return;
     }
+    startSpeech();
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       const mime = pickMime("audio");
@@ -684,8 +688,8 @@ export function Logger({
       const heard = nativeSpeech() ? await listenNative(lang) : await listenWeb(lang);
       if (remember(heard)) return;
       setError("No words were heard. Speak the meal again, a little closer, or type it.");
-    } catch {
-      setError("Transcription didn't succeed. You can type the meal.");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Transcription didn't succeed. You can type the meal.");
     } finally {
       setBusy(null);
     }

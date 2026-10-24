@@ -11,11 +11,11 @@ Built by [Aditya Agrahari](https://boss974829.github.io/) · [THE RULE](https://
 | | |
 | --- | --- |
 | Package | `com.aditya.aahar` |
-| Version | 1.0.5 |
+| Version | 1.0.6 |
 | File | [`releases/Aahar.apk`](releases/Aahar.apk) |
-| Release | [v1.0.5](https://github.com/boss974829/aahar/releases/tag/v1.0.5) |
+| Release | [v1.0.6](https://github.com/boss974829/aahar/releases/tag/v1.0.6) |
 
-On the phone: download the APK, allow install from the browser, and open **Aahar**. The journal is inside the app. You do not paste a website. **Film** opens the phone camera for a short clip (about 12 seconds). **Estimate nutrients** fills the plate from what you wrote. **Transcribe clip** turns a voice clip into words. Height, meals, and the passphrase stay on that phone. Version 1.0.5 is the current build.
+On the phone: download the APK, allow install from the browser, and open **Aahar**. The journal is inside the app. You do not paste a website. **Film** opens the phone camera for a short clip (about 12 seconds). **Estimate nutrients** fills the plate from what you wrote. **Transcribe clip** turns a voice clip into words. Height, meals, and the passphrase stay on that phone. Version 1.0.6 is the current build.
 
 This build is debug-signed so it can be installed directly. It is not a Play Store listing.
 
