@@ -43,7 +43,7 @@ function pickMime(kind: "audio" | "video"): string {
   if (typeof MediaRecorder === "undefined") return "";
   const list =
     kind === "video"
-      ? ["video/webm;codecs=vp8,opus", "video/webm", "video/mp4"]
+      ? ["video/mp4", "video/webm;codecs=vp8,opus", "video/webm;codecs=vp9,opus", "video/webm"]
       : ["audio/webm;codecs=opus", "audio/webm", "audio/mp4"];
   return list.find((type) => MediaRecorder.isTypeSupported(type)) ?? "";
 }
@@ -68,6 +68,66 @@ function grabFrame(video: HTMLVideoElement): string | null {
   if (!ctx) return null;
   ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
   return canvas.toDataURL("image/jpeg", 0.72);
+}
+
+function isHandheld(): boolean {
+  if (typeof navigator === "undefined") return false;
+  return /Android|iPhone|iPad|iPod/i.test(navigator.userAgent || "");
+}
+
+function cameraAllowed(): boolean {
+  const doc = document as Document & { permissionsPolicy?: { allowsFeature: (name: string) => boolean } };
+  try {
+    return doc.permissionsPolicy?.allowsFeature("camera") ?? true;
+  } catch {
+    return true;
+  }
+}
+
+function frameFromUrl(url: string): Promise<string | null> {
+  return new Promise((resolve) => {
+    const video = document.createElement("video");
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      resolve(grabFrame(video));
+      video.removeAttribute("src");
+      video.load();
+    };
+    video.muted = true;
+    video.playsInline = true;
+    video.preload = "auto";
+    video.src = url;
+    video.addEventListener(
+      "error",
+      () => {
+        if (settled) return;
+        settled = true;
+        resolve(null);
+      },
+      { once: true },
+    );
+    video.addEventListener(
+      "loadeddata",
+      () => {
+        const duration = video.duration;
+        const at = Number.isFinite(duration) && duration > 0 ? Math.min(0.4, duration / 2) : 0;
+        if (at <= 0) {
+          finish();
+          return;
+        }
+        video.addEventListener("seeked", finish, { once: true });
+        try {
+          video.currentTime = at;
+        } catch {
+          finish();
+        }
+      },
+      { once: true },
+    );
+    window.setTimeout(finish, 2500);
+  });
 }
 
 export function Logger({
@@ -107,6 +167,8 @@ export function Logger({
   const filmRec = useRef<MediaRecorder | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const liveRef = useRef<HTMLVideoElement | null>(null);
+  const fileRef = useRef<HTMLInputElement | null>(null);
+  const timerRef = useRef<number | null>(null);
   const chunks = useRef<Blob[]>([]);
 
   useEffect(() => {
@@ -120,12 +182,22 @@ export function Logger({
       speechRef.current?.abort();
       audioRec.current?.stop();
       filmRec.current?.stop();
+      if (timerRef.current != null) window.clearInterval(timerRef.current);
       streamRef.current?.getTracks().forEach((track) => track.stop());
       if (videoUrl) URL.revokeObjectURL(videoUrl);
     };
     // revoke once on unmount
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  useEffect(() => {
+    const video = liveRef.current;
+    const stream = streamRef.current;
+    if (!cameraOpen || videoUrl || !video || !stream) return;
+    video.srcObject = stream;
+    video.muted = true;
+    void video.play().catch(() => undefined);
+  }, [cameraOpen, videoUrl, filming]);
 
   function stopSpeech() {
     wantSpeech.current = false;
@@ -135,10 +207,10 @@ export function Logger({
     setInterim("");
   }
 
-  function startSpeech() {
+  function startSpeech(quiet = false) {
     const Ctor = speechCtor();
     if (!Ctor) {
-      setError("This browser can't listen live. Record a clip and transcribe it, or type the meal.");
+      if (!quiet) setError("This browser can't listen live. Record a clip and transcribe it, or type the meal.");
       return false;
     }
     stopSpeech();
@@ -216,34 +288,99 @@ export function Logger({
     }
   }
 
+  function pickPhoneClip() {
+    fileRef.current?.click();
+  }
+
+  function stopLive() {
+    if (timerRef.current != null) {
+      window.clearInterval(timerRef.current);
+      timerRef.current = null;
+    }
+    streamRef.current?.getTracks().forEach((track) => track.stop());
+    streamRef.current = null;
+  }
+
+  async function useClipFile(file: File | null) {
+    if (!file) return;
+    let bytes: ArrayBuffer;
+    try {
+      bytes = await file.arrayBuffer();
+    } catch {
+      setError("That clip didn't come back. Film it again.");
+      return;
+    }
+    if (bytes.byteLength < 1000) {
+      setError("That clip didn't come back. Film it again.");
+      return;
+    }
+    if (bytes.byteLength > 12_000_000) {
+      setError("That clip is too long to keep. Film about 12 seconds.");
+      return;
+    }
+    const type = file.type.startsWith("video/") ? file.type : "video/mp4";
+    const blob = new Blob([bytes], { type });
+    if (videoUrl) URL.revokeObjectURL(videoUrl);
+    const url = URL.createObjectURL(blob);
+    setVideoBlob(blob);
+    setVideoUrl(url);
+    setCameraOpen(false);
+    setFilming(false);
+    setError(null);
+    const still = await frameFromUrl(url);
+    if (still) setFrame(still);
+  }
+
   async function openCamera() {
     setError(null);
     setCameraOpen(true);
     setVideoBlob(null);
     if (videoUrl) URL.revokeObjectURL(videoUrl);
     setVideoUrl(null);
-    try {
-      let stream: MediaStream;
+    stopLive();
+    const video: MediaTrackConstraints = {
+      facingMode: { ideal: "environment" },
+      width: { ideal: 720 },
+      height: { ideal: 960 },
+    };
+    const attempts: MediaStreamConstraints[] = [
+      { video, audio: true },
+      { video, audio: false },
+      { video: true, audio: false },
+    ];
+    let stream: MediaStream | null = null;
+    let lastError: unknown = null;
+    for (const constraints of attempts) {
       try {
-        stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" }, audio: true });
-      } catch {
-        stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+        stream = await navigator.mediaDevices.getUserMedia(constraints);
+        break;
+      } catch (err) {
+        lastError = err;
       }
-      streamRef.current = stream;
-      if (liveRef.current) {
-        liveRef.current.srcObject = stream;
-        await liveRef.current.play().catch(() => undefined);
-      }
-    } catch {
+    }
+    if (!stream) {
       setCameraOpen(false);
-      setError("The camera isn't available. Type the meal, or use voice only.");
+      const denied = lastError instanceof DOMException && (lastError.name === "NotAllowedError" || lastError.name === "SecurityError");
+      setError(
+        denied
+          ? "Camera permission is blocked here. Use the phone camera, or allow the camera and try again."
+          : "The camera didn't open. Use the phone camera instead.",
+      );
+      return;
+    }
+    streamRef.current = stream;
+    setFilming(false);
+    const videoEl = liveRef.current;
+    if (videoEl) {
+      videoEl.srcObject = stream;
+      videoEl.muted = true;
+      await videoEl.play().catch(() => undefined);
     }
   }
 
   function closeCamera() {
-    filmRec.current?.stop();
-    streamRef.current?.getTracks().forEach((track) => track.stop());
-    streamRef.current = null;
+    if (filmRec.current && filmRec.current.state !== "inactive") filmRec.current.stop();
+    stopLive();
     setFilming(false);
     setCameraOpen(false);
     if (listenToo) stopSpeech();
@@ -251,53 +388,93 @@ export function Logger({
 
   function startFilm() {
     const stream = streamRef.current;
-    if (!stream) return;
+    if (!stream) {
+      setError("The camera isn't ready. Use the phone camera.");
+      return;
+    }
     const mime = pickMime("video");
     let rec: MediaRecorder;
     try {
-      rec = new MediaRecorder(stream, mime ? { mimeType: mime, videoBitsPerSecond: 700_000 } : undefined);
+      rec = new MediaRecorder(stream, mime ? { mimeType: mime } : undefined);
     } catch {
-      rec = new MediaRecorder(stream);
+      try {
+        rec = new MediaRecorder(stream);
+      } catch {
+        setError("This browser can't record in the page. Use the phone camera.");
+        return;
+      }
     }
     const bits: Blob[] = [];
     rec.ondataavailable = (event) => {
       if (event.data.size) bits.push(event.data);
     };
+    rec.onerror = () => {
+      setFilming(false);
+      setError("Recording stopped. Use the phone camera instead.");
+    };
     rec.onstop = () => {
-      const blob = new Blob(bits, { type: rec.mimeType || "video/webm" });
+      if (timerRef.current != null) {
+        window.clearInterval(timerRef.current);
+        timerRef.current = null;
+      }
+      const blob = new Blob(bits, { type: rec.mimeType || mime || "video/webm" });
       if (liveRef.current) {
         const still = grabFrame(liveRef.current);
         if (still) setFrame(still);
       }
-      stream.getTracks().forEach((track) => track.stop());
-      streamRef.current = null;
-      if (blob.size > 0) {
-        setVideoBlob(blob);
-        setVideoUrl(URL.createObjectURL(blob));
-      }
+      stopLive();
       setFilming(false);
+      if (blob.size < 1000) {
+        setError("That clip came out empty. Use the phone camera.");
+        return;
+      }
+      if (videoUrl) URL.revokeObjectURL(videoUrl);
+      setVideoBlob(blob);
+      setVideoUrl(URL.createObjectURL(blob));
     };
-    rec.start();
+    try {
+      rec.start(250);
+    } catch {
+      setError("Recording didn't start. Use the phone camera.");
+      return;
+    }
     filmRec.current = rec;
     setFilming(true);
     setSeconds(0);
-    if (listenToo) startSpeech();
+    setError(null);
+    if (listenToo) startSpeech(true);
     const started = Date.now();
-    const timer = window.setInterval(() => {
+    timerRef.current = window.setInterval(() => {
       const s = Math.min(12, Math.round((Date.now() - started) / 1000));
       setSeconds(s);
-      if (s >= 12 && rec.state !== "inactive") {
+      if (s >= 12 && rec.state === "recording") {
+        if (timerRef.current != null) {
+          window.clearInterval(timerRef.current);
+          timerRef.current = null;
+        }
         rec.stop();
         if (listenToo) stopSpeech();
-        window.clearInterval(timer);
       }
     }, 250);
   }
 
   function stopFilm() {
-    if (filmRec.current && filmRec.current.state !== "inactive") filmRec.current.stop();
+    if (timerRef.current != null) {
+      window.clearInterval(timerRef.current);
+      timerRef.current = null;
+    }
+    const rec = filmRec.current;
+    if (rec && rec.state === "recording") rec.stop();
     if (listenToo) stopSpeech();
     setFilming(false);
+  }
+
+  function onFilm() {
+    if (isHandheld() || !cameraAllowed() || typeof MediaRecorder === "undefined" || !navigator.mediaDevices?.getUserMedia) {
+      pickPhoneClip();
+      return;
+    }
+    void openCamera();
   }
 
   async function estimate() {
@@ -419,6 +596,11 @@ export function Logger({
         ]}
       />
       {error ? <Banner>{error}</Banner> : null}
+      {error?.includes("phone camera") ? (
+        <button type="button" className="press text-sm font-semibold text-sage" onClick={pickPhoneClip}>
+          Open phone camera
+        </button>
+      ) : null}
 
       {mode === "meal" ? (
         <div className="space-y-4">
@@ -441,11 +623,24 @@ export function Logger({
               {listening ? <Square size={20} strokeWidth={1.75} /> : <Mic size={20} strokeWidth={1.75} />}
               {listening ? "Stop" : "Speak"}
             </button>
-            <button type="button" onClick={() => void openCamera()} className="tile press">
+            <button type="button" onClick={onFilm} className="tile press">
               <Camera size={20} strokeWidth={1.75} />
               Film
             </button>
           </div>
+          <input
+            ref={fileRef}
+            type="file"
+            accept="video/*"
+            capture="environment"
+            aria-label="Film a meal"
+            style={{ position: "absolute", width: 1, height: 1, overflow: "hidden", clip: "rect(0, 0, 0, 0)" }}
+            onChange={(event) => {
+              const file = event.target.files?.[0] ?? null;
+              event.target.value = "";
+              void useClipFile(file);
+            }}
+          />
           {listening ? (
             <div className="flex h-8 items-center gap-1" aria-hidden="true">
               <span className="eq-bar h-4 w-1 rounded-full bg-leaf" />
@@ -714,12 +909,15 @@ export function Logger({
                 disabled={!videoBlob}
                 onClick={() => {
                   setCameraOpen(false);
-                  streamRef.current?.getTracks().forEach((track) => track.stop());
+                  stopLive();
                 }}
               >
                 Use clip
               </Button>
             </div>
+            <button type="button" className="press mt-3 h-11 text-sm font-semibold text-sage" onClick={pickPhoneClip}>
+              Phone camera
+            </button>
           </div>
         </div>
       ) : null}

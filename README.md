@@ -11,11 +11,11 @@ Built by [Aditya Agrahari](https://boss974829.github.io/) · [THE RULE](https://
 | | |
 | --- | --- |
 | Package | `com.aditya.aahar` |
-| Version | 1.0.2 |
+| Version | 1.0.3 |
 | File | [`releases/Aahar.apk`](releases/Aahar.apk) |
-| Release | [v1.0.2](https://github.com/boss974829/aahar/releases/tag/v1.0.2) |
+| Release | [v1.0.3](https://github.com/boss974829/aahar/releases/tag/v1.0.3) |
 
-On the phone: download the APK, allow install from the browser, and open **Aahar**. The journal is inside the app. You do not paste a website. Height, meals, and the passphrase stay on that phone. Version 1.0.2 is the build checked on Android 14.
+On the phone: download the APK, allow install from the browser, and open **Aahar**. The journal is inside the app. You do not paste a website. **Film** opens the phone camera for a short clip (about 12 seconds). Height, meals, and the passphrase stay on that phone. Version 1.0.3 is the build checked on Android 14.
 
 This build is debug-signed so it can be installed directly. It is not a Play Store listing.
 
