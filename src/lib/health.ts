@@ -238,6 +238,25 @@ function findFood(text: string): Food | null {
   return best?.food ?? null;
 }
 
+function findFoods(text: string): Food[] {
+  const found: Food[] = [];
+  let rest = text;
+  for (let n = 0; n < 6 && rest.trim(); n += 1) {
+    const food = findFood(rest);
+    if (!food) break;
+    let cut = "";
+    for (const alias of food.aliases) {
+      if (aliasMatches(rest, alias) && alias.length > cut.length) cut = alias;
+    }
+    if (!cut) break;
+    found.push(food);
+    const next = rest.replace(new RegExp(cut.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i"), " ");
+    if (next === rest) break;
+    rest = next;
+  }
+  return found;
+}
+
 type Unit = "g" | "ml" | "katori" | "plate" | "glass" | "cup" | "piece";
 
 function detectUnit(text: string): Unit | null {
@@ -289,23 +308,18 @@ function takeQuantity(text: string): { qty: number | null; rest: string } {
   return { qty: null, rest };
 }
 
-function parsePart(raw: string): MealItem | null {
+function parsePart(raw: string): MealItem[] {
   const cleaned = raw
     .toLowerCase()
     .replace(/[।.|,]/g, " ")
     .replace(/\s+/g, " ")
     .trim();
-  if (!cleaned) return null;
+  if (!cleaned) return [];
   const { qty, rest } = takeQuantity(cleaned);
   const unit = detectUnit(rest);
-  const food = findFood(stripNoise(rest));
-  if (!food) return null;
-  let amount = qty;
-  if (amount == null) {
-    const any = cleaned.match(/(\d+(?:\.\d+)?)/);
-    if (any && (unit === "g" || unit === "ml")) amount = Number(any[1]);
-  }
-  return itemFromFood(food, gramsFor(food, amount, unit));
+  const foods = findFoods(stripNoise(rest));
+  if (!foods.length) return [];
+  return foods.map((food, index) => itemFromFood(food, gramsFor(food, index === 0 ? qty : null, index === 0 ? unit : null)));
 }
 
 export function parseMealText(text: string): MealItem[] {
@@ -315,11 +329,11 @@ export function parseMealText(text: string): MealItem[] {
     .filter(Boolean);
   const merged = new Map<string, MealItem>();
   for (const part of parts) {
-    const item = parsePart(part);
-    if (!item) continue;
-    const prev = merged.get(item.name);
-    if (prev) prev.grams += item.grams;
-    else merged.set(item.name, item);
+    for (const item of parsePart(part)) {
+      const prev = merged.get(item.name);
+      if (prev) prev.grams += item.grams;
+      else merged.set(item.name, { ...item });
+    }
   }
   return [...merged.values()];
 }

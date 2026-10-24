@@ -223,6 +223,7 @@ async function grokText(apiKey: string, messages: unknown, maxTokens: number): P
       model: "grok-4.5",
       temperature: 0.2,
       max_tokens: maxTokens,
+      reasoning_effort: "low",
       messages,
     }),
     signal: AbortSignal.timeout(28_000),

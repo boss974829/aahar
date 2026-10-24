@@ -50,10 +50,89 @@ function pickMime(kind: "audio" | "video"): string {
 
 async function blobToB64(blob: Blob): Promise<string> {
   const bytes = new Uint8Array(await blob.arrayBuffer());
+  return bytesToB64(bytes);
+}
+
+function bytesToB64(bytes: Uint8Array): string {
   let bin = "";
-  const size = 0x8000;
-  for (let i = 0; i < bytes.length; i += size) bin += String.fromCharCode(...bytes.subarray(i, i + size));
+  const size = 0x4000;
+  for (let i = 0; i < bytes.length; i += size) {
+    bin += String.fromCharCode.apply(null, Array.from(bytes.subarray(i, i + size)));
+  }
   return btoa(bin);
+}
+
+function nativeSpeech(): { listen: (lang: string) => void; stop: () => void } | null {
+  if (typeof window === "undefined") return null;
+  const bridge = (window as unknown as { AaharSpeech?: { listen: (lang: string) => void; stop: () => void } }).AaharSpeech;
+  return bridge ?? null;
+}
+
+function listenNative(lang: Lang): Promise<string> {
+  const bridge = nativeSpeech();
+  if (!bridge) return Promise.resolve("");
+  return new Promise((resolve) => {
+    const host = window as unknown as {
+      __aaharHeard?: (text: string) => void;
+      __aaharPartial?: (text: string) => void;
+    };
+    const timer = window.setTimeout(() => {
+      bridge.stop();
+      resolve("");
+    }, 12_000);
+    host.__aaharHeard = (text: string) => {
+      window.clearTimeout(timer);
+      resolve((text || "").trim());
+    };
+    host.__aaharPartial = () => undefined;
+    bridge.listen(lang === "hi" ? "hi-IN" : "en-IN");
+  });
+}
+
+async function audioPayload(blob: Blob): Promise<{ audioBase64: string; mime: string }> {
+  try {
+    const ctx = new AudioContext();
+    const decoded = await ctx.decodeAudioData(await blob.arrayBuffer());
+    const rate = 16000;
+    const length = Math.max(1, Math.min(Math.ceil(decoded.duration * rate), rate * 30));
+    const offline = new OfflineAudioContext(1, length, rate);
+    const src = offline.createBufferSource();
+    src.buffer = decoded;
+    src.connect(offline.destination);
+    src.start();
+    const rendered = await offline.startRendering();
+    await ctx.close();
+    const samples = rendered.getChannelData(0);
+    const pcm = new Int16Array(samples.length);
+    for (let i = 0; i < samples.length; i += 1) {
+      const s = Math.max(-1, Math.min(1, samples[i] ?? 0));
+      pcm[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+    }
+    const data = pcm.length * 2;
+    const buffer = new ArrayBuffer(44 + data);
+    const view = new DataView(buffer);
+    const write = (offset: number, text: string) => {
+      for (let i = 0; i < text.length; i += 1) view.setUint8(offset + i, text.charCodeAt(i));
+    };
+    write(0, "RIFF");
+    view.setUint32(4, 36 + data, true);
+    write(8, "WAVE");
+    write(12, "fmt ");
+    view.setUint32(16, 16, true);
+    view.setUint16(20, 1, true);
+    view.setUint16(22, 1, true);
+    view.setUint32(24, rate, true);
+    view.setUint32(28, rate * 2, true);
+    view.setUint16(32, 2, true);
+    view.setUint16(34, 16, true);
+    write(36, "data");
+    view.setUint32(40, data, true);
+    let offset = 44;
+    for (let i = 0; i < pcm.length; i += 1, offset += 2) view.setInt16(offset, pcm[i] ?? 0, true);
+    return { audioBase64: bytesToB64(new Uint8Array(buffer)), mime: "audio/wav" };
+  } catch {
+    return { audioBase64: await blobToB64(blob), mime: (blob.type || "audio/webm").split(";")[0] || "audio/webm" };
+  }
 }
 
 function grabFrame(video: HTMLVideoElement): string | null {
@@ -173,8 +252,9 @@ export function Logger({
 
   useEffect(() => {
     if (touched) return;
-    setItems(parseMealText(transcript));
-  }, [transcript, touched]);
+    const text = [transcript, interim].filter(Boolean).join(" ").trim();
+    setItems(parseMealText(text));
+  }, [transcript, interim, touched]);
 
   useEffect(() => {
     return () => {
@@ -258,10 +338,24 @@ export function Logger({
   async function toggleMic() {
     if (listening) {
       stopSpeech();
+      nativeSpeech()?.stop();
       if (audioRec.current && audioRec.current.state !== "inactive") audioRec.current.stop();
       return;
     }
-    startSpeech();
+    const bridge = nativeSpeech();
+    if (bridge) {
+      setListening(true);
+      setError(null);
+      void listenNative(lang).then((text) => {
+        setListening(false);
+        if (!text) return;
+        setTranscript((prev) => [prev.trim(), text].filter(Boolean).join(" "));
+        setInterim("");
+        setTouched(false);
+      });
+    } else {
+      startSpeech();
+    }
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       const mime = pickMime("audio");
@@ -281,10 +375,11 @@ export function Logger({
         if (audioRec.current === rec && rec.state !== "inactive") {
           rec.stop();
           stopSpeech();
+          nativeSpeech()?.stop();
         }
       }, 30_000);
     } catch {
-      setError("Voice text can still work if the clip itself couldn't be saved.");
+      if (!bridge) setError("Voice text can still work if the clip itself couldn't be saved.");
     }
   }
 
@@ -478,40 +573,70 @@ export function Logger({
   }
 
   async function estimate() {
+    const text = [transcript, interim].filter(Boolean).join(" ").trim();
     setBusy("Estimating…");
     setError(null);
+    const local = parseMealText(text);
+    if (local.length) {
+      setItems(local);
+      setTouched(true);
+    }
     try {
-      const res = await estimateMeal({ data: { text: transcript, image: frame ?? undefined, lang } });
+      const image = frame && frame.length < 400_000 ? frame : undefined;
+      const res = await estimateMeal({ data: { text, image, lang } });
       if (!res.ok) {
-        setError(res.error);
+        if (!local.length) setError(res.error);
         return;
       }
       const incoming = res.data.items.map((item) => ({ ...item, id: crypto.randomUUID() }));
-      setItems((prev) => {
-        const names = new Set(prev.map((item) => item.name.toLowerCase()));
-        const extra = incoming.filter((item) => !names.has(item.name.toLowerCase()));
-        return extra.length ? [...prev, ...extra] : incoming;
-      });
+      setItems(incoming);
       setTouched(true);
       setNote(res.data.note || null);
+    } catch {
+      if (!local.length) setError("The estimate didn't come through. Name the foods, or pick them below.");
     } finally {
       setBusy(null);
     }
   }
 
   async function transcribe() {
-    if (!audioBlob) return;
     setBusy("Transcribing…");
     setError(null);
     try {
-      const res = await transcribeClip({
-        data: { audioBase64: await blobToB64(audioBlob), mime: audioBlob.type || "audio/webm", lang },
-      });
-      if (!res.ok) setError(res.error);
-      else {
-        setTranscript((prev) => [prev.trim(), res.data.text].filter(Boolean).join(" "));
-        setTouched(false);
+      if (audioBlob) {
+        const payload = await audioPayload(audioBlob);
+        const res = await transcribeClip({ data: { ...payload, lang } });
+        if (res.ok && res.data.text) {
+          setTranscript((prev) => [prev.trim(), res.data.text].filter(Boolean).join(" "));
+          setInterim("");
+          setTouched(false);
+          return;
+        }
+        const onPhone = nativeSpeech() || /phone|device|unavailable/i.test(res.ok ? "" : res.error);
+        if (onPhone) {
+          const heard = await listenNative(lang);
+          if (heard) {
+            setTranscript((prev) => [prev.trim(), heard].filter(Boolean).join(" "));
+            setInterim("");
+            setTouched(false);
+            return;
+          }
+        }
+        if (!res.ok) {
+          setError(res.error);
+          return;
+        }
+      } else if (nativeSpeech()) {
+        const heard = await listenNative(lang);
+        if (heard) {
+          setTranscript((prev) => [prev.trim(), heard].filter(Boolean).join(" "));
+          setTouched(false);
+          return;
+        }
+        setError("No words were heard. Try again a little closer to the phone, or type the meal.");
       }
+    } catch {
+      setError("Transcription didn't succeed. You can type the meal.");
     } finally {
       setBusy(null);
     }
@@ -739,7 +864,12 @@ export function Logger({
           )}
           {videoUrl ? <video src={videoUrl} controls playsInline className="media" /> : null}
           <div className="flex flex-wrap gap-2">
-            <Button variant="quiet" className="h-11" disabled={!!busy || (!transcript.trim() && !frame)} onClick={() => void estimate()}>
+            <Button
+              variant="quiet"
+              className="h-11"
+              disabled={!!busy || (![transcript, interim].join("").trim() && !frame)}
+              onClick={() => void estimate()}
+            >
               {busy === "Estimating…" ? busy : "Estimate nutrients"}
             </Button>
             {audioBlob ? (
@@ -752,7 +882,7 @@ export function Logger({
                 variant="ghost"
                 className="h-11"
                 onClick={() => {
-                  setItems(parseMealText(transcript));
+                  setItems(parseMealText([transcript, interim].filter(Boolean).join(" ")));
                   setTouched(false);
                 }}
               >

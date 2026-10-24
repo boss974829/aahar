@@ -11,6 +11,10 @@ import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.provider.MediaStore;
+import android.speech.RecognitionListener;
+import android.speech.RecognizerIntent;
+import android.speech.SpeechRecognizer;
+import android.webkit.JavascriptInterface;
 import android.webkit.PermissionRequest;
 import android.webkit.ValueCallback;
 import android.webkit.WebChromeClient;
@@ -21,6 +25,8 @@ import android.webkit.WebView;
 import android.webkit.WebViewClient;
 import androidx.core.content.FileProvider;
 import androidx.webkit.WebViewAssetLoader;
+
+import org.json.JSONObject;
 
 import java.io.File;
 
@@ -57,6 +63,7 @@ public class MainActivity extends Activity {
         settings.setAllowFileAccess(true);
         settings.setAllowContentAccess(true);
         settings.setMediaPlaybackRequiresUserGesture(false);
+        web.addJavascriptInterface(new SpeechBridge(this, web), "AaharSpeech");
 
         web.setWebChromeClient(new WebChromeClient() {
             @Override
@@ -168,5 +175,89 @@ public class MainActivity extends Activity {
             return;
         }
         super.onBackPressed();
+    }
+}
+
+class SpeechBridge {
+    private final Activity activity;
+    private final WebView web;
+    private SpeechRecognizer recognizer;
+    private boolean heard;
+    private int session;
+
+    SpeechBridge(Activity activity, WebView web) {
+        this.activity = activity;
+        this.web = web;
+    }
+
+    @JavascriptInterface
+    public void listen(String lang) {
+        activity.runOnUiThread(() -> start(lang));
+    }
+
+    @JavascriptInterface
+    public void stop() {
+        activity.runOnUiThread(() -> finish(""));
+    }
+
+    private void start(String lang) {
+        halt();
+        heard = false;
+        final int mine = ++session;
+        if (!SpeechRecognizer.isRecognitionAvailable(activity)) {
+            finish("");
+            return;
+        }
+        if (Build.VERSION.SDK_INT >= 23
+                && activity.checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            finish("");
+            return;
+        }
+        recognizer = SpeechRecognizer.createSpeechRecognizer(activity);
+        recognizer.setRecognitionListener(new RecognitionListener() {
+            @Override public void onReadyForSpeech(Bundle params) {}
+            @Override public void onBeginningOfSpeech() {}
+            @Override public void onRmsChanged(float rmsdB) {}
+            @Override public void onBufferReceived(byte[] buffer) {}
+            @Override public void onEndOfSpeech() {}
+            @Override public void onError(int error) { if (mine == session) finish(""); }
+            @Override public void onResults(Bundle results) {
+                if (mine != session) return;
+                java.util.ArrayList<String> list = results.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION);
+                finish(list != null && !list.isEmpty() ? list.get(0) : "");
+            }
+            @Override public void onPartialResults(Bundle partialResults) {}
+            @Override public void onEvent(int eventType, Bundle params) {}
+        });
+        Intent intent = new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH);
+        intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM);
+        intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE, lang == null || lang.startsWith("hi") ? "hi-IN" : "en-IN");
+        intent.putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, false);
+        intent.putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1);
+        recognizer.startListening(intent);
+    }
+
+    private void halt() {
+        session += 1;
+        if (recognizer == null) return;
+        SpeechRecognizer old = recognizer;
+        recognizer = null;
+        try {
+            old.cancel();
+        } catch (RuntimeException ignored) {
+            // already finished
+        }
+        old.destroy();
+    }
+
+    private void finish(String text) {
+        if (heard) return;
+        heard = true;
+        if (recognizer != null) {
+            recognizer.destroy();
+            recognizer = null;
+        }
+        String quoted = JSONObject.quote(text == null ? "" : text);
+        web.post(() -> web.evaluateJavascript("window.__aaharHeard && window.__aaharHeard(" + quoted + ")", null));
     }
 }
