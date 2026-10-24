@@ -11,10 +11,11 @@ Built by [Aditya Agrahari](https://boss974829.github.io/) · [THE RULE](https://
 | | |
 | --- | --- |
 | Package | `com.aditya.aahar` |
+| Version | 1.0.1 |
 | File | [`releases/Aahar.apk`](releases/Aahar.apk) |
-| Release | [v1.0.0](https://github.com/boss974829/aahar/releases/tag/v1.0.0) |
+| Release | [v1.0.1](https://github.com/boss974829/aahar/releases/tag/v1.0.1) |
 
-On the phone: download the APK, allow install from the browser, open **Aahar**. The first screen asks for your journal address (the deployed Aahar site). It is remembered on that phone. **Full site** in the developer page of the web app is the same journal.
+On the phone: download the APK, allow install from the browser, and open **Aahar**. The journal is inside the app. You do not paste a website. Height, meals, and the passphrase stay on that phone.
 
 This build is debug-signed so it can be installed directly. It is not a Play Store listing.
 
